@@ -47,7 +47,7 @@ No additional Python dependencies beyond what ComfyUI already provides.
 
 ## Credits
 
-- **Anima 2B**: [dataautogpt3](https://huggingface.co/dataautogpt3)
+- **Anima 2B**: [circlestone-labs/Anima](https://huggingface.co/circlestone-labs/Anima)
 - **Qwen 3.5 4B for Anima**: [nightknocker/cosmos-qwen3.5](https://huggingface.co/nightknocker/cosmos-qwen3.5)
 
 ## License
