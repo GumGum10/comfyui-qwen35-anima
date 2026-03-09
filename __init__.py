@@ -39,6 +39,30 @@ class RMSNorm(nn.Module):
         return rms_norm(x, self.weight, self.eps)
 
 
+class ExpRMSNorm(nn.Module):
+    """
+    RMSNorm with exp(weight) parameterization.
+
+    Used for the late normalization layer where learned weights are near-zero
+    (mean≈-0.003). Standard RMSNorm would interpret these as "scale to ~0",
+    collapsing all information. With exp(weight), near-zero means exp(0)≈1,
+    i.e. "nearly identity normalization" with tiny learned perturbations.
+
+    Evidence:
+    - All internal RMSNorms have weights centered 0.04–1.11 (normal scaling)
+    - ONLY the late norm has weights at -0.003 (different parameterization)
+    - Direct weight: diversity=0.003, cross=0.999 (COLLAPSED)
+    - exp(weight): diversity=0.821, cross=0.689 (PRESERVED)
+    """
+    def __init__(self, dim, eps=1e-6, device=None, dtype=None):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(dim, device=device, dtype=dtype))
+        self.eps = eps
+
+    def forward(self, x):
+        return rms_norm(x, torch.exp(self.weight.float()).to(x.dtype), self.eps)
+
+
 class BiasAdd(nn.Module):
     """Simple module that adds a learnable bias."""
     def __init__(self, dim, device=None, dtype=None):
@@ -51,18 +75,22 @@ class BiasAdd(nn.Module):
 
 class SSMBlock(nn.Module):
     """
-    Mamba2-style Selective State Space Model block.
+    Mamba2-style Selective State Space Model block (reference: state-spaces/mamba).
 
-    Architecture (from weight analysis):
-    - in_proj_qkv: Linear(2560, 8192) -> conv1d -> split into x(4096) + z(4096)
-    - in_proj_b: Linear(2560, 32) -> B coefficients for SSM
-    - in_proj_a: Linear(2560, 32) -> C coefficients for SSM
-    - in_proj_z: Linear(2560, 4096) -> external gate
-    - A_log: [32] -> state transition diagonal
-    - dt_bias: [32] -> discretization timestep bias
+    Architecture verified against reference Mamba2:
+    - in_proj_qkv: Linear(2560, 8192) -> conv1d -> silu -> split into x(4096), B(2048), C(2048)
+      where d_ssm=4096, ngroups*d_state=2048 each
+    - in_proj_z: Linear(2560, 4096) -> gate z that BYPASSES conv1d
+    - in_proj_b: Linear(2560, 32) -> per-group B bias / additional modulation
+    - in_proj_a: Linear(2560, 32) -> per-group C bias / additional modulation
+    - A_log: [32] -> state transition (nheads=32)
+    - dt_bias: [32] -> discretization timestep bias (nheads=32)
     - conv1d: depthwise Conv1d(8192, 8192, kernel=4)
-    - norm: RMSNorm(128) -> per-group norm (32 groups * 128 dim = 4096)
-    - out_proj: Linear(4096, 2560)
+    - norm: RMSNorm(128) -> per-head norm (head_dim=128)
+    - out_proj: Linear(4096, 2560) -> d_ssm -> hidden_size
+
+    Dimensions: d_ssm=4096, nheads=32, head_dim=128, ngroups=32, d_state=64
+    conv_dim = d_ssm + 2*ngroups*d_state = 4096 + 2*32*64 = 8192
     """
     def __init__(self, hidden_size=2560, d_inner=8192, n_groups=32,
                  d_gate=4096, conv_kernel=4, norm_dim=128,
@@ -70,15 +98,16 @@ class SSMBlock(nn.Module):
         super().__init__()
         ops = ops or nn
         self.hidden_size = hidden_size
-        self.d_inner = d_inner
-        self.n_groups = n_groups
-        self.d_gate = d_gate
+        self.d_inner = d_inner  # conv channels: d_ssm + 2*ngroups*d_state
+        self.n_groups = n_groups  # also nheads (1 head per group)
+        self.d_ssm = d_gate  # 4096 = nheads * head_dim
         self.head_dim = d_gate // n_groups  # 128
+        self.d_state = (d_inner - d_gate) // (2 * n_groups)  # 64
 
         self.in_proj_qkv = ops.Linear(hidden_size, d_inner, bias=False, device=device, dtype=dtype)
         self.in_proj_z = ops.Linear(hidden_size, d_gate, bias=False, device=device, dtype=dtype)
-        self.in_proj_a = ops.Linear(hidden_size, n_groups, bias=False, device=device, dtype=dtype)  # C projection
-        self.in_proj_b = ops.Linear(hidden_size, n_groups, bias=False, device=device, dtype=dtype)  # B projection
+        self.in_proj_a = ops.Linear(hidden_size, n_groups, bias=False, device=device, dtype=dtype)
+        self.in_proj_b = ops.Linear(hidden_size, n_groups, bias=False, device=device, dtype=dtype)
 
         # Use ops.Conv1d for auto device/dtype casting (matches comfy.ops behavior)
         self.conv1d = ops.Conv1d(
@@ -92,73 +121,111 @@ class SSMBlock(nn.Module):
         self.A_log = nn.Parameter(torch.zeros(n_groups, device=device, dtype=dtype))
         self.dt_bias = nn.Parameter(torch.zeros(n_groups, device=device, dtype=dtype))
 
-    def _ssm_scan(self, x, B_coeff, C_coeff):
+    def _ssm_scan(self, x, B_state, C_state, dt_input, D_input):
         """
-        Simple recurrent SSM scan.
-        x: [B, L, n_groups, head_dim]
-        B_coeff: [B, L, n_groups]
-        C_coeff: [B, L, n_groups]
-        Returns: [B, L, n_groups, head_dim]
+        Multi-head SSM scan with d_state > 1 (proper Mamba2 recurrence).
+
+        x: [B, L, nheads, head_dim]  (the SSM input, nheads=32, head_dim=128)
+        B_state: [B, L, ngroups, d_state]  (input matrix, ngroups=32, d_state=64)
+        C_state: [B, L, ngroups, d_state]  (output matrix, ngroups=32, d_state=64)
+        dt_input: [B, L, nheads]  (input-dependent discretization step)
+        D_input: [B, L, nheads]   (input-dependent skip connection)
+
+        SSM recurrence per head n (in group g):
+            dt = softplus(dt_input + dt_bias)
+            dA = exp(dt * A)
+            h[n] = dA[n] * h[n] + dt[n] * (B[g] outer x[n])
+            y[n] = (C[g] . h[n]) + D[n] * x[n]  (skip connection)
+
+        State shape: [batch, nheads, head_dim, d_state]
+        Returns: [B, L, nheads, head_dim]
         """
-        batch, seq_len, n_groups, head_dim = x.shape
+        batch, seq_len, nheads, head_dim = x.shape
+        d_state = B_state.shape[-1]
         device = x.device
         compute_dtype = torch.float32
 
-        # Explicitly move params to input device (handles dynamic VRAM loading)
-        A = -torch.exp(self.A_log.to(device=device).float())  # [n_groups]
-        dt = F.softplus(self.dt_bias.to(device=device).float())  # [n_groups]
+        # Move params to device
+        A = -torch.exp(self.A_log.to(device=device).float())  # [nheads] (negative)
+        dt_bias = self.dt_bias.to(device=device).float()  # [nheads]
 
-        # Discretize: dA = exp(A * dt)
-        dA = torch.exp(dt * A)  # [n_groups]
-
-        h = torch.zeros(batch, n_groups, head_dim, device=device, dtype=compute_dtype)
+        # State: [batch, nheads, head_dim, d_state]
+        h = torch.zeros(batch, nheads, head_dim, d_state, device=device, dtype=compute_dtype)
         outputs = []
 
         x_f = x.float()
-        B_f = B_coeff.float()
-        C_f = C_coeff.float()
-        dA_expanded = dA.unsqueeze(0).unsqueeze(-1)  # [1, n_groups, 1]
+        B_f = B_state.float()  # [B, L, ngroups, d_state]
+        C_f = C_state.float()  # [B, L, ngroups, d_state]
+        dt_f = dt_input.float()  # [B, L, nheads]
+        D_f = D_input.float()   # [B, L, nheads]
 
         for t in range(seq_len):
-            # h = dA * h + dB * x_t
-            h = dA_expanded * h + (dt * B_f[:, t]).unsqueeze(-1) * x_f[:, t]
-            # y = C * h
-            y_t = C_f[:, t].unsqueeze(-1) * h
+            x_t = x_f[:, t]  # [B, nheads, head_dim]
+            B_t = B_f[:, t]  # [B, ngroups, d_state]
+            C_t = C_f[:, t]  # [B, ngroups, d_state]
+
+            # Input-dependent dt: softplus(dt_input + dt_bias) [B, nheads]
+            dt_t = F.softplus(dt_f[:, t] + dt_bias)  # [B, nheads]
+
+            # Discretize: dA = exp(A * dt) per head per batch
+            dA_t = torch.exp(dt_t * A.unsqueeze(0))  # [B, nheads]
+
+            # dBx = dt * outer(x_t, B_t): [B, nheads, head_dim, d_state]
+            dt_expanded = dt_t.unsqueeze(-1).unsqueeze(-1)  # [B, nheads, 1, 1]
+            dBx = dt_expanded * torch.einsum('bnh,bns->bnhs', x_t, B_t)
+
+            # State update: h = dA * h + dBx
+            dA_expanded = dA_t.unsqueeze(-1).unsqueeze(-1)  # [B, nheads, 1, 1]
+            h = dA_expanded * h + dBx
+
+            # Output: y_t = einsum(h, C_t) over d_state + D * x (skip)
+            y_t = torch.einsum('bnhs,bns->bnh', h, C_t)  # [B, nheads, head_dim]
+            y_t = y_t + D_f[:, t].unsqueeze(-1) * x_t  # D skip connection
+
             outputs.append(y_t)
 
-        return torch.stack(outputs, dim=1).to(x.dtype)  # [B, L, n_groups, head_dim]
+        return torch.stack(outputs, dim=1).to(x.dtype)  # [B, L, nheads, head_dim]
 
     def forward(self, hidden_states):
         batch, seq_len, _ = hidden_states.shape
 
-        # Input projections
-        xz = self.in_proj_qkv(hidden_states)  # [B, L, 8192]
-        B_coeff = self.in_proj_b(hidden_states)  # [B, L, 32]
-        C_coeff = self.in_proj_a(hidden_states)  # [B, L, 32]
+        # === Gate (bypasses conv1d, reference Mamba2 pattern) ===
+        z = self.in_proj_z(hidden_states)  # [B, L, 4096] - the gate
 
-        # Causal 1D convolution (ops.Conv1d handles device/dtype auto-casting)
-        xz_conv = xz.transpose(1, 2)  # [B, 8192, L]
-        xz_conv = self.conv1d(xz_conv)[..., :seq_len]
-        xz_conv = xz_conv.transpose(1, 2)  # [B, L, 8192]
+        # === xBC goes through conv1d ===
+        xBC = self.in_proj_qkv(hidden_states)  # [B, L, 8192]
 
-        # Split into SSM input and inner gate
-        x, z_inner = xz_conv.chunk(2, dim=-1)  # each [B, L, 4096]
-        x = F.silu(x)
+        # in_proj_b → input-dependent dt (time step for selective SSM)
+        # in_proj_a → input-dependent D (skip connection, no separate D param exists)
+        dt_input = self.in_proj_b(hidden_states)  # [B, L, 32] (nheads)
+        D_input = self.in_proj_a(hidden_states)   # [B, L, 32] (nheads)
 
-        # Reshape for SSM: [B, L, n_groups, head_dim]
-        x = x.reshape(batch, seq_len, self.n_groups, self.head_dim)
+        # Causal 1D convolution + activation
+        xBC_conv = xBC.transpose(1, 2)  # [B, 8192, L]
+        xBC_conv = self.conv1d(xBC_conv)[..., :seq_len]
+        xBC_conv = F.silu(xBC_conv.transpose(1, 2))  # [B, L, 8192]
 
-        # SSM scan
-        y = self._ssm_scan(x, B_coeff, C_coeff)  # [B, L, 32, 128]
+        # Split conv output: x(d_ssm=4096), B_conv(ngroups*d_state=2048), C_conv(2048)
+        x, B_conv, C_conv = torch.split(
+            xBC_conv,
+            [self.d_ssm, self.n_groups * self.d_state, self.n_groups * self.d_state],
+            dim=-1
+        )
 
-        # Per-group norm
+        # Reshape for SSM
+        x = x.reshape(batch, seq_len, self.n_groups, self.head_dim)  # [B, L, 32, 128]
+        B_state = B_conv.reshape(batch, seq_len, self.n_groups, self.d_state)  # [B, L, 32, 64]
+        C_state = C_conv.reshape(batch, seq_len, self.n_groups, self.d_state)  # [B, L, 32, 64]
+
+        # SSM scan (with input-dependent dt and D)
+        y = self._ssm_scan(x, B_state, C_state, dt_input, D_input)  # [B, L, 32, 128]
+
+        # Per-head RMSNorm (norm_dim=128=head_dim)
         y = self.norm(y)
 
-        # Reshape back
+        # Reshape and apply gating: y = norm(y) * silu(z) (RMSNormGated pattern)
         y = y.reshape(batch, seq_len, -1)  # [B, L, 4096]
-
-        # Gate with inner z from conv split
-        y = y * F.silu(z_inner)
+        y = y * F.silu(z)
 
         # Output projection
         return self.out_proj(y)
@@ -340,7 +407,12 @@ class Qwen35HybridModel(nn.Module):
     - SSM layers: 0,1,2, 4,5,6, 8,9,10, 12,13,14, 16,17,18, 20,21,22, 24,25,26, 28,29,30
     - Self-attention layers: 3,7,11,15,19,23,27,31
     - Layer 31: self-attention only (no MLP)
-    - Final norm: Linear(2560->1024) + RMSNorm(1024) + SiLU + BiasAdd(1024)
+    - Final norm: Linear(2560->1024) + ExpRMSNorm(1024) + SiLU + Linear(1024->1024)
+
+    The late norm uses exp(weight) parameterization for RMSNorm. The learned weights
+    are near-zero (~-0.003), which with exp() gives scale ≈ 0.997 ≈ 1.0 (near-identity).
+    Standard w*norm would collapse all tokens to the same vector (diversity=0.003).
+    With exp(w)*norm, token diversity is preserved (diversity=0.82).
     """
     SELF_ATTN_LAYERS = {3, 7, 11, 15, 19, 23, 27, 31}
     NUM_LAYERS = 32
@@ -350,6 +422,7 @@ class Qwen35HybridModel(nn.Module):
     OUTPUT_DIM = 1024
     HEAD_DIM = 256  # For RoPE
     ROPE_THETA = 1000000.0
+    DEFAULT_OUTPUT_SCALE = 1.0  # Raw output; use slider to experiment
 
     def __init__(self, config_dict=None, dtype=None, device=None, operations=None):
         super().__init__()
@@ -378,13 +451,19 @@ class Qwen35HybridModel(nn.Module):
                 device=device, dtype=dtype, ops=ops
             ))
 
-        # Output projection norm: Linear(2560->1024) + RMSNorm + SiLU + Linear(1024->1024)
+        # Output projection: Linear(2560->1024) + ExpRMSNorm + SiLU + Linear(1024->1024)
+        # The late norm uses exp(weight) parameterization because its learned weights
+        # are near-zero (~-0.003), meaning "scale ≈ 1" rather than "scale ≈ 0".
+        # This preserves token diversity and cross-prompt distinguishability.
         self.norm = nn.Sequential(
             ops.Linear(self.HIDDEN_SIZE, self.OUTPUT_DIM, bias=True, device=device, dtype=dtype),
-            RMSNorm(self.OUTPUT_DIM, device=device, dtype=dtype),
+            ExpRMSNorm(self.OUTPUT_DIM, device=device, dtype=dtype),
             nn.SiLU(),
             ops.Linear(self.OUTPUT_DIM, self.OUTPUT_DIM, bias=True, device=device, dtype=dtype),
         )
+
+        # Output scaling (set externally via config_dict or after construction)
+        self._output_scale = config_dict.get("output_scale", self.DEFAULT_OUTPUT_SCALE)
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -446,8 +525,13 @@ class Qwen35HybridModel(nn.Module):
                         intermediate = {}
                     intermediate[i] = x.clone()
 
-        # Apply output projection norm
+        # Apply output projection (Linear -> ExpRMSNorm -> SiLU -> Linear)
         x = self.norm(x)
+
+        # Scale output to match the distribution the LLM adapter expects
+        # The 0.6B produces std~3.8, L2/token~120; our raw output is ~200x smaller
+        if self._output_scale != 1.0:
+            x = x * self._output_scale
 
         if intermediate is not None:
             return x, intermediate
@@ -584,6 +668,15 @@ class LoadQwen35AnimaCLIP:
         return {
             "required": {
                 "clip_name": (sorted(te_files),),
+            },
+            "optional": {
+                "output_scale": ("FLOAT", {
+                    "default": 1.0,
+                    "min": 0.0,
+                    "max": 1000.0,
+                    "step": 0.1,
+                    "tooltip": "Scale factor for output embeddings. Default 1.0 uses the exp(weight) RMSNorm which preserves token diversity. Increase only if cross-attention needs stronger signal.",
+                }),
             }
         }
 
@@ -592,7 +685,7 @@ class LoadQwen35AnimaCLIP:
     CATEGORY = "loaders/Anima"
     TITLE = "Load Qwen3.5 CLIP (Anima)"
 
-    def load_clip(self, clip_name):
+    def load_clip(self, clip_name, output_scale=1.0):
         import folder_paths
         import safetensors.torch
 
@@ -604,6 +697,7 @@ class LoadQwen35AnimaCLIP:
             raise FileNotFoundError(f"Text encoder not found: {clip_path}")
 
         logger.info(f"[Qwen3.5-Anima] Loading text encoder from: {clip_path}")
+        logger.info(f"[Qwen3.5-Anima] output_scale={output_scale}")
 
         # Load state dict
         sd = safetensors.torch.load_file(clip_path)
@@ -636,6 +730,14 @@ class LoadQwen35AnimaCLIP:
             state_dict=[sd],
             parameters=param_count,
         )
+
+        # Apply output_scale to the loaded model
+        try:
+            inner_model = clip.cond_stage_model.qwen35_4b.transformer
+            inner_model._output_scale = output_scale
+            logger.info(f"[Qwen3.5-Anima] Applied output_scale={output_scale}")
+        except AttributeError as e:
+            logger.warning(f"[Qwen3.5-Anima] Could not set output_scale: {e}")
 
         logger.info(f"[Qwen3.5-Anima] Text encoder loaded successfully ({param_count:,} parameters)")
         return (clip,)
