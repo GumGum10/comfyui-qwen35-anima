@@ -88,6 +88,30 @@ class BiasAdd(nn.Module):
         return x + self.bias
 
 
+class ResidualMLP(nn.Module):
+    """
+    Learned nonlinear residual correction applied after Procrustes alignment.
+    final = R(x - mean_4b) + mean_06b + h(x)
+    """
+    def __init__(self, dim=1024, hidden=2048, dropout=0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, dim),
+        )
+        self.norm = nn.LayerNorm(dim)
+        nn.init.normal_(self.net[-1].weight, std=1e-4)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, x):
+        return self.net(self.norm(x))
+
+
 class SSMBlock(nn.Module):
     """
     Mamba2-style Selective State Space Model block (reference: state-spaces/mamba).
@@ -411,6 +435,45 @@ class HybridBlock(nn.Module):
 
 
 # ============================================================================
+# Token Trie for efficient artist token sequence matching
+# ============================================================================
+
+class _TokenTrie:
+    """Trie keyed on token IDs for fast subsequence matching."""
+    __slots__ = ('children', 'value')
+
+    def __init__(self):
+        self.children = {}  # token_id -> _TokenTrie
+        self.value = None   # (name, embedding) at matching leaf
+
+    def insert(self, tokens, value):
+        node = self
+        for t in tokens:
+            if t not in node.children:
+                node.children[t] = _TokenTrie()
+            node = node.children[t]
+        node.value = value
+
+    def match(self, token_list, start=0):
+        """
+        Find longest match in token_list starting at index `start`.
+        Returns ((name, embedding), match_length) or None.
+        """
+        node = self
+        last_match = None
+        length = 0
+        for i in range(start, len(token_list)):
+            t = token_list[i]
+            if t not in node.children:
+                break
+            node = node.children[t]
+            length += 1
+            if node.value is not None:
+                last_match = (node.value, length)
+        return last_match
+
+
+# ============================================================================
 # Full Qwen 3.5 Hybrid Model
 # ============================================================================
 
@@ -448,6 +511,15 @@ class Qwen35HybridModel(nn.Module):
 
     # Path to Procrustes alignment matrix (computed by compute_alignment.py)
     ALIGNMENT_FILE = os.path.join(NODE_DIR, "rotation_matrix.safetensors")
+
+    # Path to pre-cached 0.6B artist embeddings (computed by scrape_and_embed_artists.py)
+    ARTIST_CACHE_FILE = os.path.join(NODE_DIR, "artist_embeddings_06b.safetensors")
+
+    # Path to pre-cached 0.6B meta/quality/time/safety tag embeddings (computed by encode_meta_tags.py)
+    META_CACHE_FILE = os.path.join(NODE_DIR, "meta_embeddings_06b.safetensors")
+
+    # Path to learned residual MLP correction (computed by experiment_residual_mlp.py)
+    RESIDUAL_MLP_FILE = os.path.join(NODE_DIR, "residual_mlp.safetensors")
 
     def __init__(self, config_dict=None, dtype=None, device=None, operations=None):
         super().__init__()
@@ -506,6 +578,34 @@ class Qwen35HybridModel(nn.Module):
         if self._use_alignment:
             self._load_alignment()
 
+        # Artist embedding cache: 0.6B ground-truth embeddings for known artists.
+        # When alignment rotates 4B embeddings to match 0.6B space, artist names
+        # (not in the Procrustes training set) get displaced. This cache stores
+        # the real 0.6B embeddings and splices them in at artist token positions,
+        # bypassing both Procrustes rotation and calibration for those tokens.
+        self._artist_cache = {}    # name -> mean-pooled [1024] tensor
+        self._artist_trie = None   # _TokenTrie for fast token subsequence matching
+        self._use_artist_cache = config_dict.get("use_artist_cache", False)
+
+        # Meta tag embedding cache: 0.6B ground-truth embeddings for structural tags
+        # (quality, aesthetic scores, year/period, meta descriptors, safety ratings).
+        # Same principle as artist cache — these tags may not be well-represented
+        # in the Procrustes training distribution, so we splice in ground-truth.
+        self._meta_cache = {}      # tag_name -> mean-pooled [1024] tensor
+        self._use_meta_cache = config_dict.get("use_meta_cache", False)
+
+        # Load caches and build unified splice trie
+        if self._use_artist_cache:
+            self._load_artist_cache()
+        if self._use_meta_cache:
+            self._load_meta_cache()
+
+        # Residual MLP: learned nonlinear correction on top of Procrustes
+        self._residual_mlp = None
+        self._use_residual_mlp = config_dict.get("use_residual_mlp", False)
+        if self._use_residual_mlp:
+            self._load_residual_mlp()
+
         # Pending visual embeddings for vision-text encoding
         # Set externally before forward(), cleared after
         self._pending_visual_embeds = None
@@ -550,6 +650,335 @@ class Qwen35HybridModel(nn.Module):
         else:
             logger.warning(f"[Qwen3.5-Anima] Alignment file not found: {self.ALIGNMENT_FILE}")
             self._use_alignment = False
+
+    def _load_residual_mlp(self):
+        """Load learned residual MLP correction weights."""
+        mlp_file = self.RESIDUAL_MLP_FILE
+        if os.path.exists(mlp_file):
+            try:
+                sd = safetensors_torch.load_file(mlp_file)
+                hidden = sd["net.0.weight"].shape[0]
+                self._residual_mlp = ResidualMLP(dim=self.OUTPUT_DIM, hidden=hidden, dropout=0.0)
+                self._residual_mlp.load_state_dict(sd)
+                self._residual_mlp.eval()
+                param_count = sum(p.numel() for p in self._residual_mlp.parameters())
+                logger.info(f"[Qwen3.5-Anima] Loaded residual MLP: hidden={hidden}, params={param_count:,}")
+            except Exception as e:
+                logger.warning(f"[Qwen3.5-Anima] Failed to load residual MLP: {e}")
+                self._use_residual_mlp = False
+                self._residual_mlp = None
+        else:
+            logger.warning(f"[Qwen3.5-Anima] Residual MLP not found: {mlp_file}")
+            self._use_residual_mlp = False
+            self._residual_mlp = None
+
+    def _load_meta_cache(self):
+        """Load pre-cached 0.6B meta tag embeddings."""
+        import json
+        if not os.path.exists(self.META_CACHE_FILE):
+            logger.warning(f"[Qwen3.5-Anima] Meta cache not found: {self.META_CACHE_FILE}")
+            logger.warning("[Qwen3.5-Anima] Run encode_meta_tags.py to generate it.")
+            self._use_meta_cache = False
+            return
+
+        try:
+            from safetensors import safe_open
+
+            with safe_open(self.META_CACHE_FILE, framework="pt") as f:
+                meta = f.metadata()
+                tag_list = json.loads(meta.get('tag_list', '[]'))
+
+                for tag in tag_list:
+                    key = tag.replace('.', '_dot_').replace('/', '_slash_').replace('(', '_lp_').replace(')', '_rp_')
+                    try:
+                        emb = f.get_tensor(key).float()  # [num_tokens, 1024]
+                        self._meta_cache[tag] = emb.mean(dim=0)  # [1024]
+                    except Exception:
+                        pass
+
+            logger.info(f"[Qwen3.5-Anima] Loaded meta cache: {len(self._meta_cache)} tags")
+
+            # Diagnostic: sample tags
+            for dt in ['masterpiece', 'score_9', 'year 2024', 'newest', 'absurdres', 'safe']:
+                if dt in self._meta_cache:
+                    e = self._meta_cache[dt]
+                    logger.info(f"[Meta Cache DIAG] '{dt}' loaded: L2={e.norm():.2f}")
+
+            # Build/rebuild the splice trie to include meta entries
+            self._build_artist_trie()
+
+        except Exception as e:
+            logger.warning(f"[Qwen3.5-Anima] Failed to load meta cache: {e}")
+            import traceback
+            traceback.print_exc()
+            self._use_meta_cache = False
+
+    def _load_artist_cache(self):
+        """Load pre-cached 0.6B artist embeddings and build token trie."""
+        import json
+        if not os.path.exists(self.ARTIST_CACHE_FILE):
+            logger.warning(f"[Qwen3.5-Anima] Artist cache not found: {self.ARTIST_CACHE_FILE}")
+            logger.warning("[Qwen3.5-Anima] Run scrape_and_embed_artists.py to generate it.")
+            self._use_artist_cache = False
+            return
+
+        try:
+            from safetensors import safe_open
+
+            # Read metadata for artist list
+            with safe_open(self.ARTIST_CACHE_FILE, framework="pt") as f:
+                meta = f.metadata()
+                artist_list = json.loads(meta.get('artist_list', '[]'))
+
+                # Mean-pool per-token embeddings for each artist
+                for name in artist_list:
+                    key = name.replace('.', '_dot_').replace('/', '_slash_')
+                    try:
+                        emb = f.get_tensor(key).float()  # [num_tokens, 1024]
+                        self._artist_cache[name] = emb.mean(dim=0)  # [1024]
+                    except Exception:
+                        pass  # Skip artists with missing keys
+
+            logger.info(f"[Qwen3.5-Anima] Loaded artist cache: {len(self._artist_cache)} artists")
+
+            # Diagnostic: sample a few known artists
+            diag_names = ['tianliang_duohe_fangdongye', 'color_br', 'nelsion', 'dairi']
+            for dn in diag_names:
+                if dn in self._artist_cache:
+                    e = self._artist_cache[dn]
+                    logger.info(f"[Artist Cache DIAG] '{dn}' loaded: L2={e.norm():.2f}, mean={e.mean():.4f}, std={e.std():.4f}")
+                else:
+                    logger.info(f"[Artist Cache DIAG] '{dn}' NOT found in cache")
+
+            # Build token trie for fast lookup
+            self._build_artist_trie()
+
+        except Exception as e:
+            logger.warning(f"[Qwen3.5-Anima] Failed to load artist cache: {e}")
+            import traceback
+            traceback.print_exc()
+            self._use_artist_cache = False
+
+    def _build_artist_trie(self):
+        """Build a trie of 4B token IDs for each cached artist/meta tag for fast matching.
+
+        For artists, inserts multiple format variants:
+          - @name_with_underscores   (Danbooru raw)
+          - @name with spaces        (common user input, 0.6B training format)
+          - artist:name_with_underscores
+          - artist:name with spaces
+          - name_with_underscores    (bare, no prefix)
+          - name with spaces         (bare, no prefix)
+
+        For meta tags, inserts bare name variants (spaces + underscores).
+        """
+        from transformers import AutoTokenizer
+
+        # Load the 4B tokenizer to know how artist names are tokenized
+        if os.path.isdir(QWEN35_TOKENIZER_DIR) and (
+            os.path.exists(os.path.join(QWEN35_TOKENIZER_DIR, "vocab.json")) or
+            os.path.exists(os.path.join(QWEN35_TOKENIZER_DIR, "tokenizer.json"))
+        ):
+            tokenizer = AutoTokenizer.from_pretrained(
+                QWEN35_TOKENIZER_DIR, trust_remote_code=False
+            )
+        else:
+            tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-4B")
+
+        self._artist_trie = _TokenTrie()
+        count = 0
+
+        # Discover what tokens '@' becomes in various contexts so we can
+        # build context-aware trie entries that actually match real prompts.
+        # Standalone '@' may tokenize as 31, but after ", " it becomes 554, etc.
+        _ctx_at_variants = set()  # set of token-lists for '@' in context
+        for ctx_str in [", @X", " @X", "(@X"]:
+            ctx_toks = tokenizer.encode(ctx_str, add_special_tokens=False)
+            x_toks = tokenizer.encode("X", add_special_tokens=False)
+            # The last token(s) should be 'X'; everything before is '@' in context
+            if ctx_toks[-len(x_toks):] == x_toks:
+                at_prefix = tuple(ctx_toks[:-len(x_toks)])
+                if at_prefix:
+                    _ctx_at_variants.add(at_prefix)
+        # Also standalone '@'
+        _ctx_at_variants.add(tuple(tokenizer.encode("@", add_special_tokens=False)))
+        logger.info(f"[Artist Trie] Discovered @ token variants: {[list(v) for v in _ctx_at_variants]}")
+
+        for name, embedding in self._artist_cache.items():
+            # Danbooru names use underscores; users may type spaces
+            name_spaces = name.replace('_', ' ')
+            seen_seqs = set()
+
+            # Trie values are (name, embedding, prefix_skip).
+            # prefix_skip = number of leading tokens (e.g. '@', ', @') to
+            # keep untouched during splicing.
+
+            # 1. Bare name variants (match at position 0 or after word-boundary chars)
+            for bare in [name, name_spaces]:
+                tokens = tokenizer.encode(bare, add_special_tokens=False)
+                tok_key = tuple(tokens)
+                if tokens and tok_key not in seen_seqs:
+                    self._artist_trie.insert(tokens, (name, embedding, 0))
+                    seen_seqs.add(tok_key)
+                    count += 1
+
+            # 1b. Space-prefixed bare variants (BPE merges leading space into word;
+            #     "artist" standalone → different tokens than " artist" after ", ")
+            for bare in [name, name_spaces]:
+                sp_tokens = tokenizer.encode(" " + bare, add_special_tokens=False)
+                tok_key = tuple(sp_tokens)
+                if sp_tokens and tok_key not in seen_seqs:
+                    self._artist_trie.insert(sp_tokens, (name, embedding, 0))
+                    seen_seqs.add(tok_key)
+                    count += 1
+
+            # 2. @name variants with every discovered @ token form
+            #    prefix_skip = len(at_prefix) so we don't overwrite @/,/( embeddings
+            for bare in [name, name_spaces]:
+                bare_tokens = tokenizer.encode(bare, add_special_tokens=False)
+                for at_prefix in _ctx_at_variants:
+                    full = list(at_prefix) + bare_tokens
+                    tok_key = tuple(full)
+                    if tok_key not in seen_seqs:
+                        self._artist_trie.insert(full, (name, embedding, len(at_prefix)))
+                        seen_seqs.add(tok_key)
+                        count += 1
+
+            # 3. artist: prefix variants (entire match is conceptually the artist)
+            for variant in [f"artist:{name}", f"artist:{name_spaces}"]:
+                tokens = tokenizer.encode(variant, add_special_tokens=False)
+                tok_key = tuple(tokens)
+                if tokens and tok_key not in seen_seqs:
+                    self._artist_trie.insert(tokens, (name, embedding, 0))
+                    seen_seqs.add(tok_key)
+                    count += 1
+
+        logger.info(f"[Qwen3.5-Anima] Built artist trie: {count} entries (from {len(self._artist_cache)} artists)")
+
+        # ── Meta tag entries ──────────────────────────────────────────────
+        # BPE tokenizers merge leading spaces into words, so the same tag
+        # produces completely different tokens standalone vs after punctuation:
+        #   "masterpiece" standalone → [13236, 21666]  (2 tokens)
+        #   " masterpiece" (after ", ") → [56744]       (1 token, space merged)
+        # We must insert BOTH standalone and space-prefixed variants.
+        # The old comma-prefix-discovery approach fails here because the BPE
+        # pre-tokenizer groups ", " and " word" into separate pre-tokens,
+        # making ", X" → [comma, spaceX] where spaceX ≠ X.
+        meta_count = 0
+        if self._use_meta_cache and self._meta_cache:
+            for tag, embedding in self._meta_cache.items():
+                tag_spaces = tag.replace('_', ' ')
+                seen_seqs = set()
+
+                # 1. Bare variants (match at position 0 or after word-boundary chars)
+                for bare in set([tag, tag_spaces]):
+                    tokens = tokenizer.encode(bare, add_special_tokens=False)
+                    tok_key = tuple(tokens)
+                    if tokens and tok_key not in seen_seqs:
+                        self._artist_trie.insert(tokens, (tag, embedding, 0))
+                        seen_seqs.add(tok_key)
+                        meta_count += 1
+
+                # 2. Space-prefixed variants (how BPE actually encodes tags after ", ")
+                #    The leading space is merged into the first token by BPE, so
+                #    " masterpiece" → [56744] (different from standalone [13236, 21666]).
+                #    We replace ALL tokens including the space-merged one because the
+                #    cached 0.6B embedding represents the full concept.
+                for bare in set([tag, tag_spaces]):
+                    sp_tokens = tokenizer.encode(" " + bare, add_special_tokens=False)
+                    tok_key = tuple(sp_tokens)
+                    if sp_tokens and tok_key not in seen_seqs:
+                        self._artist_trie.insert(sp_tokens, (tag, embedding, 0))
+                        seen_seqs.add(tok_key)
+                        meta_count += 1
+
+            logger.info(f"[Qwen3.5-Anima] Added {meta_count} meta tag entries to splice trie (from {len(self._meta_cache)} tags)")
+
+        # Diagnostic: test realistic prompts (not just standalone variants)
+        diag_prompts = {
+            # Standalone
+            '@tianliang duohe fangdongye': 'standalone spaces',
+            '@tianliang_duohe_fangdongye': 'standalone underscores',
+            'artist:dairi': 'artist: prefix',
+            # Context-realistic (how they appear inside actual prompts)
+            '1girl, @tianliang duohe fangdongye, blue hair': 'in-prompt spaces',
+            '(@tianliang duohe fangdongye, :1.15)': 'in-parens weighted',
+            '1girl, @ebifurya, masterpiece': 'in-prompt short name',
+            '1girl, @dairi, solo': 'in-prompt dairi',
+        }
+        # Add meta tag diag prompts if meta cache is loaded
+        if self._use_meta_cache and self._meta_cache:
+            diag_prompts.update({
+                'masterpiece, best quality, 1girl': 'meta quality tags',
+                'score_9, score_8, 1girl': 'meta aesthetic tags',
+                '1girl, year 2024, newest': 'meta time tags',
+                '1girl, absurdres, safe': 'meta + safety tags',
+            })
+        for dp, desc in diag_prompts.items():
+            test_tokens = tokenizer.encode(dp, add_special_tokens=False)
+            # Scan entire prompt for matches (not just pos 0)
+            matches = []
+            pos = 0
+            while pos < len(test_tokens):
+                match = self._artist_trie.match(test_tokens, pos)
+                if match:
+                    (mname, _, pskip), mlen = match
+                    matches.append((mname, pos, mlen, pskip))
+                    pos += mlen
+                else:
+                    pos += 1
+            if matches:
+                for mname, mpos, mlen, pskip in matches:
+                    splice_start = mpos + pskip
+                    splice_len = mlen - pskip
+                    logger.info(f"[Artist Trie DIAG] [{desc}] '{dp}' -> MATCH '{mname}' at pos {mpos}:{mpos+mlen} (splice {splice_start}:{splice_start+splice_len}, skip {pskip} prefix tokens)")
+            else:
+                logger.info(f"[Artist Trie DIAG] [{desc}] '{dp}' -> NO MATCH (tokens={test_tokens[:12]}...)")
+
+        del tokenizer  # Free tokenizer memory
+
+    def _splice_artist_embeddings(self, input_ids, x):
+        """
+        Replace Procrustes-rotated embeddings at artist/meta token positions
+        with cached 0.6B ground-truth embeddings.
+
+        The trie stores token sequences for artists and meta tags as tokenized
+        by the 4B tokenizer. We scan input_ids for matches and overwrite the
+        corresponding output positions with the mean-pooled 0.6B embedding.
+        """
+        if self._artist_trie is None or (not self._artist_cache and not self._meta_cache):
+            return x
+
+        B = input_ids.shape[0]
+        spliced_any = False
+        for b in range(B):
+            ids = input_ids[b].tolist()
+            pos = 0
+            while pos < len(ids):
+                match = self._artist_trie.match(ids, pos)
+                if match:
+                    (name, cached_emb, prefix_skip), match_len = match
+                    # Only overwrite the NAME tokens, skip prefix (@, comma etc.)
+                    splice_start = pos + prefix_skip
+                    splice_len = match_len - prefix_skip
+                    if splice_len > 0:
+                        cached = cached_emb.to(device=x.device, dtype=x.dtype)
+                        x[b, splice_start:splice_start + splice_len, :] = (
+                            cached.unsqueeze(0).expand(splice_len, -1)
+                        )
+                    logger.info(
+                        f"[Artist Cache] Spliced '{name}' at positions {splice_start}:{splice_start + splice_len} "
+                        f"(batch {b}, {splice_len} name tokens, skipped {prefix_skip} prefix tokens)"
+                    )
+                    spliced_any = True
+                    pos += match_len
+                else:
+                    pos += 1
+
+        if not spliced_any:
+            logger.debug("[Artist Cache] No artist matches found in input tokens")
+
+        return x
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -649,6 +1078,9 @@ class Qwen35HybridModel(nn.Module):
         # Maps 2560-dim hidden states to 1024-dim adapter space
         x = self.norm(x)
 
+        # Save pre-Procrustes output for residual MLP input
+        x_pre_procrustes = x if (self._use_residual_mlp and self._residual_mlp is not None) else None
+
         # Procrustes alignment: rotation + optional bias shift.
         # Decomposed into two parts:
         #   1. Rotation: R @ (x - m4b) — always applied when alignment is on.
@@ -668,11 +1100,59 @@ class Qwen35HybridModel(nn.Module):
             # Blend the re-centering: (1-α)*m4b + α*m06b
             x = x_rotated + (1.0 - alpha) * m4b + alpha * m06b
 
+        # Residual MLP correction (after Procrustes, before calibration)
+        if x_pre_procrustes is not None:
+            mlp = self._residual_mlp
+            if next(mlp.parameters()).device != x.device:
+                mlp.to(device=x.device, dtype=x.dtype)
+            with torch.no_grad():
+                correction = mlp(x_pre_procrustes)
+            x = x + correction
+
         # Per-dimension affine calibration
         if self._use_calibration and self._calibration_scale is not None:
             cal_scale = self._calibration_scale.to(device=x.device, dtype=x.dtype)
             cal_bias = self._calibration_bias.to(device=x.device, dtype=x.dtype)
             x = x * cal_scale + cal_bias
+
+        # Embedding splice: replace Procrustes-rotated + calibrated embeddings
+        # at artist/meta token positions with cached 0.6B ground-truth.
+        # This bypasses both rotation and calibration for these tokens since
+        # the cached values are already in the target (0.6B) embedding space.
+        #
+        # NOTE: ComfyUI's SDClipModel.forward() passes input_ids=None (it embeds
+        # tokens itself). We use _stashed_input_ids set by Qwen35_4BClipModel.forward().
+        _splice_ids = getattr(self, '_stashed_input_ids', None)
+        _any_cache = (self._use_artist_cache or self._use_meta_cache)
+        if _any_cache and self._artist_trie is not None and _splice_ids is not None:
+            if not hasattr(self, '_artist_splice_call_count'):
+                self._artist_splice_call_count = 0
+            self._artist_splice_call_count += 1
+
+            # The stashed IDs may have different length than x if process_tokens
+            # inserted extra embeddings. Truncate/pad to match x's seq dim.
+            stashed_len = _splice_ids.shape[1]
+            x_len = x.shape[1]
+            if stashed_len != x_len:
+                if self._artist_splice_call_count <= 2:
+                    logger.info(
+                        f"[Artist Splice DIAG] Stashed IDs length ({stashed_len}) != x length ({x_len}), "
+                        f"truncating to min. This is expected when extra embeds are injected."
+                    )
+                # Only scan up to the shorter length; extra positions don't have token IDs
+                scan_len = min(stashed_len, x_len)
+                _splice_ids = _splice_ids[:, :scan_len]
+
+            if self._artist_splice_call_count <= 2:
+                non_pad = (_splice_ids[0] != 151643).sum().item()
+                logger.info(
+                    f"[Artist Splice DIAG] forward() call #{self._artist_splice_call_count}: "
+                    f"stashed_ids shape={_splice_ids.shape}, non-pad tokens={non_pad}, "
+                    f"x shape={x.shape}, x L2 mean={x.norm(dim=-1).mean():.2f}"
+                )
+            x = self._splice_artist_embeddings(_splice_ids, x)
+            # Clear stashed IDs to avoid re-use on next call
+            self._stashed_input_ids = None
 
         # Additional uniform scaling
         if self._output_scale != 1.0:
@@ -1259,6 +1739,34 @@ class Qwen35_4BClipModel(comfy.sd1_clip.SDClipModel):
             model_options=model_options
         )
 
+    def forward(self, tokens):
+        """Override to capture raw token IDs for the artist cache splice.
+
+        ComfyUI's SDClipModel.forward() embeds the tokens itself and passes
+        input_ids=None to the transformer. We extract the integer token IDs
+        from the tokens list and stash them on the inner model so that
+        _splice_artist_embeddings() can use them.
+        """
+        # tokens is a list of lists; each inner item is either an int (token ID)
+        # or a dict/tensor (embedding override). Extract just the int IDs.
+        import numbers
+        pad_token = self.special_tokens.get("pad", 151643)
+        raw_ids = []
+        for batch in tokens:
+            ids = []
+            for item in batch:
+                if isinstance(item, numbers.Integral):
+                    ids.append(int(item))
+                else:
+                    # Non-token embed placeholder — use pad so trie won't match
+                    ids.append(pad_token)
+            raw_ids.append(ids)
+
+        # Stash on the inner model for use in forward()
+        self.transformer._stashed_input_ids = torch.tensor(raw_ids, dtype=torch.long)
+
+        return super().forward(tokens)
+
 
 class AnimaQwen35TEModel(comfy.sd1_clip.SD1ClipModel):
     """
@@ -1520,6 +2028,24 @@ class LoadQwen35AnimaCLIP:
                     "default": False,
                     "tooltip": "Apply Procrustes rotation to align 4B spatial/pose concept directions with 0.6B. Requires rotation_matrix.safetensors (run compute_alignment.py to generate). Helps with 'from side', 'from behind', and other viewpoint tags.",
                 }),
+                "use_artist_cache": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Use pre-cached 0.6B embeddings for artist names (@artist). Requires artist_embeddings_06b.safetensors (run scrape_and_embed_artists.py). "
+                               "When alignment is on, Procrustes rotation can weaken artist-specific style because artists weren't in the training set. "
+                               "This splices ground-truth 0.6B artist embeddings at matched token positions, preserving artist fidelity.",
+                }),
+                "use_meta_cache": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Use pre-cached 0.6B embeddings for meta/quality/time/safety tags (masterpiece, score_9, year 2024, etc). "
+                               "Requires meta_embeddings_06b.safetensors (run encode_meta_tags.py). "
+                               "Splices ground-truth 0.6B embeddings for structural tags that may be distorted by Procrustes alignment.",
+                }),
+                "use_residual_mlp": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Apply learned nonlinear MLP correction after Procrustes alignment. "
+                               "Requires residual_mlp.safetensors (run experiment_residual_mlp.py). "
+                               "Adds a small neural network correction that captures nonlinear patterns the linear Procrustes rotation misses.",
+                }),
                 "alignment_strength": ("FLOAT", {
                     "default": 0.0,
                     "min": 0.0,
@@ -1544,7 +2070,7 @@ class LoadQwen35AnimaCLIP:
     CATEGORY = "loaders/Anima"
     TITLE = "Load Qwen3.5 CLIP (Anima)"
 
-    def load_clip(self, clip_name, use_calibration=True, use_alignment=False, alignment_strength=1.0, output_scale=1.0):
+    def load_clip(self, clip_name, use_calibration=True, use_alignment=False, use_artist_cache=False, use_meta_cache=False, use_residual_mlp=False, alignment_strength=1.0, output_scale=1.0):
         import folder_paths
         import safetensors.torch
 
@@ -1556,7 +2082,7 @@ class LoadQwen35AnimaCLIP:
             raise FileNotFoundError(f"Text encoder not found: {clip_path}")
 
         logger.info(f"[Qwen3.5-Anima] Loading text encoder from: {clip_path}")
-        logger.info(f"[Qwen3.5-Anima] use_calibration={use_calibration}, use_alignment={use_alignment}, alignment_strength={alignment_strength}, output_scale={output_scale}")
+        logger.info(f"[Qwen3.5-Anima] use_calibration={use_calibration}, use_alignment={use_alignment}, use_artist_cache={use_artist_cache}, use_meta_cache={use_meta_cache}, use_residual_mlp={use_residual_mlp}, alignment_strength={alignment_strength}, output_scale={output_scale}")
 
         # Load state dict
         sd = safetensors.torch.load_file(clip_path)
@@ -1596,14 +2122,26 @@ class LoadQwen35AnimaCLIP:
             inner_model._use_calibration = use_calibration
             inner_model._use_alignment = use_alignment
             inner_model._alignment_strength = alignment_strength
+            inner_model._use_artist_cache = use_artist_cache
+            inner_model._use_meta_cache = use_meta_cache
+            inner_model._use_residual_mlp = use_residual_mlp
             if use_calibration:
                 inner_model._load_calibration()
             if use_alignment:
                 inner_model._load_alignment()
+            if use_artist_cache:
+                inner_model._load_artist_cache()
+            if use_meta_cache:
+                inner_model._load_meta_cache()
+            if use_residual_mlp:
+                inner_model._load_residual_mlp()
             logger.info(
                 f"[Qwen3.5-Anima] Applied output_scale={output_scale}, "
                 f"calibration={'ON' if use_calibration else 'OFF'}, "
-                f"alignment={'ON' if use_alignment else 'OFF'}"
+                f"alignment={'ON' if use_alignment else 'OFF'}, "
+                f"artist_cache={'ON' if use_artist_cache else 'OFF'}, "
+                f"meta_cache={'ON' if use_meta_cache else 'OFF'}, "
+                f"residual_mlp={'ON' if use_residual_mlp else 'OFF'}"
             )
         except AttributeError as e:
             logger.warning(f"[Qwen3.5-Anima] Could not set parameters: {e}")
